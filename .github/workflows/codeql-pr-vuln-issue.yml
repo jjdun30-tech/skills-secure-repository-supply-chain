@@ -20,7 +20,7 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: 'json,csharp,javascript' # Adjust to your repo's languages
+          languages: 'csharp,javascript' # Adjust to your repo's languages
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
