@@ -1,0 +1,51 @@
+name: "CodeQL PR Vulnerability Scan and Issue Creation"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  codeql-analysis:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'json' # Adjust to your repo's languages
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Install jq and GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo apt-get install -y gh
+
+      - name: Check for vulnerabilities and create issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get code scanning alerts for this repo
+          gh api repos/${{ github.repository }}/code-scanning/alerts \
+            -H "Accept: application/vnd.github+json" > codeql_alerts.json
+
+          NUM_ALERTS=$(jq '. | length' codeql_alerts.json)
+          if [ "$NUM_ALERTS" -gt "0" ]; then
+            ALERT_TITLES=$(jq -r '.[] | "* " + .rule.id + ": " + .most_recent_instance.message.text' codeql_alerts.json)
+            gh issue create \
+              --title "CodeQL detected $NUM_ALERTS vulnerability(ies) in PR #${{ github.event.pull_request.number }}" \
+              --body "CodeQL scan found the following vulnerabilities in this pull request:\n\n$ALERT_TITLES\n\nSee Security tab for details."
+          fi
