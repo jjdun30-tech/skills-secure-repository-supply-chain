@@ -1,8 +1,8 @@
-name: Create Issue on CodeQL Alert
+name: Create/Update PR Issue from CodeQL Alerts (safe target context)
 
 on:
-  code_scanning_alert:
-    types: [created, reopened, appeared_in_branch]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -10,54 +10,78 @@ permissions:
   issues: write
 
 jobs:
-  open_issue_for_alert:
+  create_or_update_issue:
     runs-on: ubuntu-latest
     steps:
-      - name: Open/label issue for PR branch CodeQL alerts
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const alert = context.payload.alert;
-            if (!alert) return;
+      - name: Install jq and GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo apt-get install -y gh
 
-            // Only alerts produced by CodeQL
-            if ((alert.tool && alert.tool.name) !== 'CodeQL') return;
+      - name: Query alerts for PR refs and create/update issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-            // Ignore Actions hygiene rules if you want
-            if (alert.rule?.id?.startsWith('actions/')) return;
+          REPO="${{ github.repository }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+          HEAD_REF="refs/heads/${HEAD_BRANCH}"
+          MERGE_REF="refs/pull/${PR_NUM}/merge"
 
-            // Keep low/medium/high/critical severities (skip "note"/null)
-            const sev = (alert.rule?.security_severity_level || '').toLowerCase();
-            const keep = ['low','medium','high','critical'].includes(sev);
-            if (!keep) return;
+          fetch() {
+            local REF="$1"
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -f ref="$REF" \
+              -f tool_name="CodeQL" \
+              -f state="open" \
+              "repos/${REPO}/code-scanning/alerts" || echo "[]"
+          }
 
-            // Only create issues for alerts that relate to a PR’s head ref when present
-            // If there is an associated PR, GitHub includes it in alert.most_recent_instance?.ref as refs/pull/<n>/merge
-            // We’ll still open an issue regardless, but you could filter further if desired.
+          # Retry a few times in case analyze upload hasn’t indexed yet
+          ATTEMPTS=8
+          DELAY=5
+          for i in $(seq 1 $ATTEMPTS); do
+            A_HEAD=$(fetch "$HEAD_REF")
+            A_MERGE=$(fetch "$MERGE_REF")
+            # Merge and filter
+            echo "$A_HEAD" | jq -c '. as $a | $a' > a_head.json
+            echo "$A_MERGE" | jq -c '. as $a | $a' > a_merge.json
+            jq -s 'add' a_head.json a_merge.json > alerts_raw.json
 
-            const number = alert.number;           // unique alert number in repo
-            const ruleId = alert.rule?.id || 'unknown-rule';
-            const title = `[CodeQL] Alert #${number}: ${ruleId} (${sev || 'unknown'})`;
+            jq '
+              unique_by(.number)
+              | map(select(.rule.id | startswith("actions/") | not))
+              | map(select((.rule.security_severity_level // "") as $s |
+                           ($s == "low" or $s == "medium" or $s == "high" or $s == "critical")))
+            ' alerts_raw.json > alerts.json
 
-            // Avoid duplicates
-            const existing = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue in:title "${title}"`
-            });
-            if (existing.data.total_count > 0) return;
+            COUNT=$(jq 'length' alerts.json)
+            if [ "$COUNT" -gt 0 ] || [ "$i" -eq "$ATTEMPTS" ]; then
+              break
+            fi
+            echo "No qualifying alerts yet (attempt $i/$ATTEMPTS). Sleeping ${DELAY}s…"
+            sleep $DELAY
+          done
 
-            const body = [
-              `**Rule:** \`${ruleId}\``,
-              `**Severity:** ${sev || 'unknown'}`,
-              alert.html_url ? `**Alert:** ${alert.html_url}` : '',
-              '',
-              'Automatically opened for tracking. Link fixing PRs here.'
-            ].filter(Boolean).join('\n');
+          COUNT=$(jq 'length' alerts.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No qualifying CodeQL alerts for $HEAD_REF or $MERGE_REF."
+            exit 0
+          fi
 
-            const created = await github.rest.issues.create({
-              ...context.repo,
-              title,
-              body,
-              labels: ['Vulnerability Found']
-            });
+          LINES=$(jq -r '.[] | "* \(.rule.id): \(.most_recent_instance.message.text)"' alerts.json)
 
-            core.notice(`Opened issue #${created.data.number} for CodeQL alert #${number}.`);
+          # Create or update a single issue per PR
+          EXISTING=$(gh issue list --state open --search "in:title CodeQL detected .* PR #$PR_NUM" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Updated scan results:\n\n$LINES"
+          else
+            gh issue create \
+              --title "CodeQL detected ${COUNT} vulnerability(ies) in PR #${PR_NUM}" \
+              --body "CodeQL scan found the following vulnerabilities in this pull request:\n\n${LINES}\n\nSee the Security tab for details." \
+              --label "Vulnerability Found"
+          fi
