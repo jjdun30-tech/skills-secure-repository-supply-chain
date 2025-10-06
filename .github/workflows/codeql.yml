@@ -9,7 +9,6 @@ on:
   schedule:
     - cron: '24 20 * * 6'
 
-# ⬇️ Everything below replaces your old "jobs:" section
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -33,18 +32,21 @@ jobs:
           - language: python
             build-mode: none
           - language: java-kotlin
-            build-mode: manual          # ✅ fixed here
+            build-mode: manual
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
+      # JDK only needed for Java/Kotlin
       - name: Set up JDK for Java/Kotlin
         if: matrix.language == 'java-kotlin'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17'   # change to 11/21 if your code requires it
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -53,24 +55,68 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
           queries: security-extended,security-and-quality
 
-      - name: Build (Maven/Gradle auto-detect)
+      # ===================== Java/Kotlin manual build =====================
+      # If the repo has a real Maven/Gradle project, we'll use it.
+      # Otherwise we compile stand-alone Java files (e.g., test/VulnSqlJdbc.java)
+      - name: Build (Maven/Gradle auto-detect, or compile lone Java files)
         if: matrix.language == 'java-kotlin'
         shell: bash
         run: |
           set -euo pipefail
+
+          # If your Java/Kotlin code is under a subdir, uncomment and set it here:
+          # cd backend
+
           if [[ -f "pom.xml" ]]; then
+            echo "Detected Maven project"
             mvn -B -DskipTests clean package
-          elif [[ -f "gradlew" ]]; then
+            exit 0
+          fi
+
+          if [[ -f "gradlew" ]]; then
+            echo "Detected Gradle wrapper"
             chmod +x ./gradlew
             ./gradlew clean build -x test --no-daemon
-          elif command -v gradle >/dev/null 2>&1 && [[ -f "build.gradle"* ]]; then
-            gradle clean build -x test --no-daemon
-          else
-            echo "No recognized Java/Kotlin build found (pom.xml or gradlew)."
-            exit 1
+            exit 0
           fi
+
+          if [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+            echo "Detected Gradle (system)"
+            gradle clean build -x test --no-daemon
+            exit 0
+          fi
+
+          echo "No Maven/Gradle detected — compiling standalone Java sources"
+
+          mkdir -p build/classes
+          mkdir -p libs
+
+          # Download Servlet API for javax.servlet.* used in test/VulnSqlJdbc.java
+          SERVLET_JAR=libs/javax.servlet-api-4.0.1.jar
+          if [[ ! -f "$SERVLET_JAR" ]]; then
+            echo "Downloading Servlet API..."
+            curl -sSfL "https://repo1.maven.org/maven2/javax/servlet/javax.servlet-api/4.0.1/javax.servlet-api-4.0.1.jar" -o "$SERVLET_JAR"
+          fi
+
+          # Adjust path if your Java files live elsewhere
+          mapfile -t JAVA_SOURCES < <(find test -type f -name '*.java' || true)
+
+          if [[ ${#JAVA_SOURCES[@]} -eq 0 ]]; then
+            echo "No Java sources found under 'test/'. Nothing to compile."
+            # Not a hard error; CodeQL can still analyze other languages.
+            exit 0
+          fi
+
+          echo "Compiling Java sources:"
+          printf '  %s\n' "${JAVA_SOURCES[@]}"
+
+          javac -cp "$SERVLET_JAR" -d build/classes "${JAVA_SOURCES[@]}"
+
+          echo "Compilation finished. Classes in:"
+          ls -R build/classes || true
+      # =================== /Java/Kotlin manual build ======================
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:${{matrix.language}}"
+          category: "/language:${{ matrix.language }}"
