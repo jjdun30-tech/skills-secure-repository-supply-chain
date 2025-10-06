@@ -10,9 +10,10 @@ on:
     types: [opened, synchronize, reopened]
 
 permissions:
-  contents: read
-  security-events: read
+  contents: write
+  security-events: write
   issues: write
+  pull-requests: write
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
