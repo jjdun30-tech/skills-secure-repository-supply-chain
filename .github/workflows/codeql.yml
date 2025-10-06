@@ -9,6 +9,7 @@ on:
   schedule:
     - cron: '24 20 * * 6'
 
+# ⬇️ Everything below replaces your old "jobs:" section
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -29,27 +30,45 @@ jobs:
             build-mode: none
           - language: javascript-typescript
             build-mode: none
-          - language: python                   # ✅ for the subprocess injection & secrets test
+          - language: python
             build-mode: none
-          - language: java-kotlin              # ✅ for the JDBC SQL injection test
-            build-mode: autobuild
+          - language: java-kotlin
+            build-mode: manual          # ✅ fixed here
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up JDK for Java/Kotlin
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          queries: security-extended,security-and-quality  # ✅ broader coverage
+          queries: security-extended,security-and-quality
 
-      - if: matrix.build-mode == 'manual'
+      - name: Build (Maven/Gradle auto-detect)
+        if: matrix.language == 'java-kotlin'
         shell: bash
         run: |
-          echo 'Switch to manual build commands for compiled languages if needed'
-          exit 1
+          set -euo pipefail
+          if [[ -f "pom.xml" ]]; then
+            mvn -B -DskipTests clean package
+          elif [[ -f "gradlew" ]]; then
+            chmod +x ./gradlew
+            ./gradlew clean build -x test --no-daemon
+          elif command -v gradle >/dev/null 2>&1 && [[ -f "build.gradle"* ]]; then
+            gradle clean build -x test --no-daemon
+          else
+            echo "No recognized Java/Kotlin build found (pom.xml or gradlew)."
+            exit 1
+          fi
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
