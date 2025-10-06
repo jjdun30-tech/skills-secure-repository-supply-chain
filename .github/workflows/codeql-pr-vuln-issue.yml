@@ -1,45 +1,63 @@
-      - name: Check for vulnerabilities and create issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+name: Create Issue on CodeQL Alert
 
-          PR_NUM="${{ github.event.pull_request.number }}"
-          PR_HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
-          PR_REF="refs/heads/${PR_HEAD_BRANCH}"
+on:
+  code_scanning_alert:
+    types: [created, reopened, appeared_in_branch]
 
-          # Fetch ONLY alerts for this PR's head branch, from CodeQL, currently open
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            -f ref="$PR_REF" \
-            -f tool_name="CodeQL" \
-            -f state="open" \
-            repos/${{ github.repository }}/code-scanning/alerts > codeql_alerts.json
+permissions:
+  contents: read
+  security-events: read
+  issues: write
 
-          # Filter: exclude GitHub Actions hygiene (rule ids starting with "actions/")
-          # Optional: keep only HIGH/CRITICAL severities
-          jq '
-            map(select(.rule.id | startswith("actions/") | not))
-            | map(select(.rule.security_severity_level == "low"
-                      or .rule.security_severity_level == "medium"
-                      or .rule.security_severity_level == "high"))
-          ' codeql_alerts.json > filtered_alerts.json
+jobs:
+  open_issue_for_alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open/label issue for PR branch CodeQL alerts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alert = context.payload.alert;
+            if (!alert) return;
 
-          NUM_ALERTS=$(jq 'length' filtered_alerts.json)
+            // Only alerts produced by CodeQL
+            if ((alert.tool && alert.tool.name) !== 'CodeQL') return;
 
-          if [ "$NUM_ALERTS" -gt 0 ]; then
-            ALERT_LINES=$(jq -r '.[] | "* \(.rule.id): \(.most_recent_instance.message.text)"' filtered_alerts.json)
+            // Ignore Actions hygiene rules if you want
+            if (alert.rule?.id?.startsWith('actions/')) return;
 
-            # De-dup: don’t open a new issue if one for this PR already exists
-            EXISTING=$(gh issue list --state open --search "in:title CodeQL detected .* PR #$PR_NUM" --json number --jq '.[0].number // empty')
-            if [ -n "$EXISTING" ]; then
-              gh issue comment "$EXISTING" --body "Updated scan results:\n\n$ALERT_LINES"
-            else
-              gh issue create \
-                --title "CodeQL detected $NUM_ALERTS vulnerability(ies) in PR #$PR_NUM" \
-                --body "CodeQL scan found the following vulnerabilities in this pull request:\n\n$ALERT_LINES\n\nSee the Security tab for details." \
-                --label "Vulnerability Found"
-            fi
-          else
-            echo "No qualifying CodeQL vulnerabilities for PR branch $PR_REF."
-          fi
+            // Keep low/medium/high/critical severities (skip "note"/null)
+            const sev = (alert.rule?.security_severity_level || '').toLowerCase();
+            const keep = ['low','medium','high','critical'].includes(sev);
+            if (!keep) return;
+
+            // Only create issues for alerts that relate to a PR’s head ref when present
+            // If there is an associated PR, GitHub includes it in alert.most_recent_instance?.ref as refs/pull/<n>/merge
+            // We’ll still open an issue regardless, but you could filter further if desired.
+
+            const number = alert.number;           // unique alert number in repo
+            const ruleId = alert.rule?.id || 'unknown-rule';
+            const title = `[CodeQL] Alert #${number}: ${ruleId} (${sev || 'unknown'})`;
+
+            // Avoid duplicates
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue in:title "${title}"`
+            });
+            if (existing.data.total_count > 0) return;
+
+            const body = [
+              `**Rule:** \`${ruleId}\``,
+              `**Severity:** ${sev || 'unknown'}`,
+              alert.html_url ? `**Alert:** ${alert.html_url}` : '',
+              '',
+              'Automatically opened for tracking. Link fixing PRs here.'
+            ].filter(Boolean).join('\n');
+
+            const created = await github.rest.issues.create({
+              ...context.repo,
+              title,
+              body,
+              labels: ['Vulnerability Found']
+            });
+
+            core.notice(`Opened issue #${created.data.number} for CodeQL alert #${number}.`);
