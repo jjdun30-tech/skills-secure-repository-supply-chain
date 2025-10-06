@@ -1,87 +1,63 @@
-name: Create/Update PR Issue from CodeQL Alerts (safe target context)
+- name: Query CodeQL alerts for PR and create/update Issue
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  shell: bash
+  run: |
+    set -euo pipefail
 
-on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+    REPO="${{ github.repository }}"
+    PR_NUM="${{ github.event.pull_request.number }}"
+    HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+    HEAD_REF="refs/heads/${HEAD_BRANCH}"
+    MERGE_REF="refs/pull/${PR_NUM}/merge"
 
-permissions:
-  contents: read
-  security-events: read
-  issues: write
+    fetch_norm() {
+      local REF="$1" OUT="$2"
+      # Try the API; on error, write an explicit marker file
+      if ! gh api -H "Accept: application/vnd.github+json" \
+            -f ref="$REF" -f tool_name="CodeQL" -f state="open" \
+            "repos/${REPO}/code-scanning/alerts" > "${OUT}.raw" 2>"${OUT}.err"; then
+        echo '[]' > "${OUT}.raw"
+      fi
+      # Normalize to array:
+      # - If object with "message" => []
+      # - If object without "message" => wrap in [obj]
+      # - If array => keep
+      jq 'if type=="array" then .
+          elif type=="object" and has("message") then []
+          elif type=="object" then [.]
+          else [] end' "${OUT}.raw" > "${OUT}.json"
+    }
 
-jobs:
-  create_or_update_issue:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install jq and GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-          sudo apt-get install -y gh
+    fetch_norm "$HEAD_REF"  a_head
+    fetch_norm "$MERGE_REF" a_merge
 
-      - name: Query alerts for PR refs and create/update issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
+    # Merge arrays safely
+    jq -s 'add' a_head.json a_merge.json > alerts_raw.json
 
-          REPO="${{ github.repository }}"
-          PR_NUM="${{ github.event.pull_request.number }}"
-          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
-          HEAD_REF="refs/heads/${HEAD_BRANCH}"
-          MERGE_REF="refs/pull/${PR_NUM}/merge"
+    # Filter out actions/* hygiene; keep low/medium/high/critical
+    jq '
+      map(select(.rule.id | startswith("actions/") | not))
+      | map(select((.rule.security_severity_level // "") as $s |
+                   ($s == "low" or $s == "medium" or $s == "high" or $s == "critical")))
+      | unique_by(.number)
+    ' alerts_raw.json > alerts.json
 
-          fetch() {
-            local REF="$1"
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              -f ref="$REF" \
-              -f tool_name="CodeQL" \
-              -f state="open" \
-              "repos/${REPO}/code-scanning/alerts" || echo "[]"
-          }
+    COUNT=$(jq 'length' alerts.json)
+    if [ "$COUNT" -eq 0 ]; then
+      echo "No qualifying CodeQL alerts for $HEAD_REF or $MERGE_REF."
+      exit 0
+    fi
 
-          # Retry a few times in case analyze upload hasn’t indexed yet
-          ATTEMPTS=8
-          DELAY=5
-          for i in $(seq 1 $ATTEMPTS); do
-            A_HEAD=$(fetch "$HEAD_REF")
-            A_MERGE=$(fetch "$MERGE_REF")
-            # Merge and filter
-            echo "$A_HEAD" | jq -c '. as $a | $a' > a_head.json
-            echo "$A_MERGE" | jq -c '. as $a | $a' > a_merge.json
-            jq -s 'add' a_head.json a_merge.json > alerts_raw.json
+    LINES=$(jq -r '.[] | "* \(.rule.id): \(.most_recent_instance.message.text)"' alerts.json)
 
-            jq '
-              unique_by(.number)
-              | map(select(.rule.id | startswith("actions/") | not))
-              | map(select((.rule.security_severity_level // "") as $s |
-                           ($s == "low" or $s == "medium" or $s == "high" or $s == "critical")))
-            ' alerts_raw.json > alerts.json
-
-            COUNT=$(jq 'length' alerts.json)
-            if [ "$COUNT" -gt 0 ] || [ "$i" -eq "$ATTEMPTS" ]; then
-              break
-            fi
-            echo "No qualifying alerts yet (attempt $i/$ATTEMPTS). Sleeping ${DELAY}s…"
-            sleep $DELAY
-          done
-
-          COUNT=$(jq 'length' alerts.json)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No qualifying CodeQL alerts for $HEAD_REF or $MERGE_REF."
-            exit 0
-          fi
-
-          LINES=$(jq -r '.[] | "* \(.rule.id): \(.most_recent_instance.message.text)"' alerts.json)
-
-          # Create or update a single issue per PR
-          EXISTING=$(gh issue list --state open --search "in:title CodeQL detected .* PR #$PR_NUM" --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "Updated scan results:\n\n$LINES"
-          else
-            gh issue create \
-              --title "CodeQL detected ${COUNT} vulnerability(ies) in PR #${PR_NUM}" \
-              --body "CodeQL scan found the following vulnerabilities in this pull request:\n\n${LINES}\n\nSee the Security tab for details." \
-              --label "Vulnerability Found"
-          fi
+    # Create or update a single issue per PR
+    EXISTING=$(gh issue list --state open --search "in:title CodeQL detected .* PR #$PR_NUM" --json number --jq '.[0].number // empty')
+    if [ -n "$EXISTING" ]; then
+      gh issue comment "$EXISTING" --body "Updated scan results:\n\n${LINES}"
+    else
+      gh issue create \
+        --title "CodeQL detected ${COUNT} vulnerability(ies) in PR #${PR_NUM}" \
+        --body "CodeQL scan found the following vulnerabilities in this pull request:\n\n${LINES}\n\nSee the Security tab for details." \
+        --label "Vulnerability Found"
+    fi
