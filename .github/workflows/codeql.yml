@@ -43,7 +43,7 @@ jobs:
       # JDK only needed for Java/Kotlin
       - name: Set up JDK for Java/Kotlin
         if: matrix.language == 'java-kotlin'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'   # change to 11/21 if your code requires it
