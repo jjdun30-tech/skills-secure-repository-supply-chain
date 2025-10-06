@@ -3,7 +3,11 @@ name: Block merge if 'Vulnerability Found' issues exist
 
 on:
   pull_request:
+    # runs for PRs targeting any branch (good)
     types: [opened, synchronize, reopened, edited, ready_for_review, labeled, unlabeled]
+  push:
+    branches: [main, dev]     # <-- ensure the job runs on dev too
+  workflow_dispatch:          # <-- lets you Run workflow from Actions UI
 
 permissions:
   contents: read
@@ -32,12 +36,9 @@ jobs:
             const { owner, repo } = context.repo;
             const label = 'Vulnerability Found';
             const q = `repo:${owner}/${repo} is:issue is:open label:"${label}"`;
-
             const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
             const openCount = res.data.total_count;
-
             core.info(`Open '${label}' issues: ${openCount}`);
-
             if (openCount > 0) {
               core.setFailed(`❌ Merge blocked: ${openCount} open issue(s) labeled '${label}' found.`);
             } else {
