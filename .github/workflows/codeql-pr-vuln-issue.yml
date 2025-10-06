@@ -18,10 +18,12 @@
 
           # Filter: exclude GitHub Actions hygiene (rule ids starting with "actions/")
           # Optional: keep only HIGH/CRITICAL severities
-          jq '
-            map(select(.rule.id | startswith("actions/") | not))
-            | map(select(.rule.security_severity_level == "high" or .rule.security_severity_level == "critical"))
-          ' codeql_alerts.json > filtered_alerts.json
+jq '
+  map(select(.rule.id | startswith("actions/") | not))
+  | map(select(.rule.security_severity_level == "low"
+            or .rule.security_severity_level == "medium"
+            or .rule.security_severity_level == "high"))
+' codeql_alerts.json > filtered_alerts.json
 
           NUM_ALERTS=$(jq 'length' filtered_alerts.json)
 
