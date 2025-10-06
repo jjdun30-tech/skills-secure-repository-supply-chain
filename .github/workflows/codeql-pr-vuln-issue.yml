@@ -1,54 +1,137 @@
-name: Create Issue on Vulnerability in PR
+name: PR Security Issues (CodeQL + Dependency Review)
 
 on:
-  pull_request:
-    types: [opened, synchronize]
+  # Fires when CodeQL creates/reopens an alert (no race conditions)
+  code_scanning_alert:
+    types: [created, reopened, appeared_in_branch]
+
+  # Runs in base-repo context (write token) for any PR update
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  security-events: read
+  issues: write
 
 jobs:
-  scan-and-create-issue:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # A) Create an Issue for CodeQL alerts (event-driven, reliable)
+  # ─────────────────────────────────────────────────────────────────────────────
+  codeql_issue:
+    if: github.event_name == 'code_scanning_alert'
     runs-on: ubuntu-latest
-    permissions:
-      security-events: read   # For CodeQL
-      contents: write         # To create issues
-      issues: write           # To create issues
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Open Issue for qualifying CodeQL alert
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const a = context.payload.alert;
+            if (!a) return;
 
-    # Run CodeQL analysis (You must have codeql workflow set up)
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: 'javascript,python' # adjust as needed
+            // Only CodeQL alerts
+            if ((a.tool && a.tool.name) !== 'CodeQL') return;
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+            // Skip Actions hygiene rules (not code vulns)
+            if (a.rule?.id?.startsWith('actions/')) return;
 
-    # Check for vulnerabilities via the GitHub API (CodeQL & Dependabot)
-    - name: Check for Vulnerabilities
-      id: check_vulns
-      run: |
-        gh api \
-          -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/security/alerts \
-          > alerts.json
-        if [ "$(jq '. | length' alerts.json)" -gt "0" ]; then
-          echo "vulnerabilities found"
-          jq '.' alerts.json > ISSUE_BODY.md
-          echo "vuln_found=true" >> $GITHUB_OUTPUT
-        else
-          echo "No vulnerabilities found"
-          echo "vuln_found=false" >> $GITHUB_OUTPUT
-        fi
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            // Keep low/medium/high/critical (skip "note"/null)
+            const sev = (a.rule?.security_severity_level || '').toLowerCase();
+            if (!['low','medium','high','critical'].includes(sev)) return;
 
-    # Create an issue if vulnerabilities are found
-    - name: Create Issue from File
-      if: steps.check_vulns.outputs.vuln_found == 'true'
-      uses: peter-evans/create-issue-from-file@v5
-      with:
-        title: "Security Vulnerability Detected in PR #${{ github.event.pull_request.number }}"
-        content-filepath: ISSUE_BODY.md
-        labels: "security, automated"
+            const number = a.number;                // repository-unique alert #
+            const ruleId = a.rule?.id || 'unknown-rule';
+            const html = a.html_url || '';
+            const title = `[CodeQL] Alert #${number}: ${ruleId} (${sev || 'unknown'})`;
+
+            // Avoid duplicates
+            const search = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:issue in:title "${title}"`
+            });
+            if (search.data.total_count > 0) return;
+
+            const body = [
+              `**Rule:** \`${ruleId}\``,
+              `**Severity:** ${sev || 'unknown'}`,
+              html ? `**Alert:** ${html}` : '',
+              '',
+              'Automatically opened from CodeQL alert. Link the fixing PR here.'
+            ].filter(Boolean).join('\n');
+
+            await github.rest.issues.create({
+              ...context.repo,
+              title,
+              body,
+              labels: ['Vulnerability Found']
+            });
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # B) Create/Update an Issue when dependency review finds vulnerable changes
+  #    (uses the official Dependency Review Action + REST compare endpoint)
+  # ─────────────────────────────────────────────────────────────────────────────
+  dependency_review_issue:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      # The action fails the check if vulnerable packages are introduced.
+      # We mark it continue-on-error so the next step can still open an Issue.
+      - name: Dependency Review
+        uses: github/dependency-review-action@v4
+        continue-on-error: true
+        with:
+          # Adjust threshold if you want (low|moderate|high|critical). Default low.
+          fail-on-severity: low
+
+      - name: Install jq and GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          sudo apt-get install -y gh
+
+      - name: Create/Update Issue for dependency vulnerabilities
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+          PR="${{ github.event.pull_request.number }}"
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Compare base...head for dependency changes (with vulnerability data)
+          # https://docs.github.com/en/rest/dependency-graph/dependency-review#get-a-diff-of-the-dependencies-between-commits
+          gh api -H "Accept: application/vnd.github+json" \
+            "repos/${REPO}/dependency-graph/compare/${BASE}...${HEAD}" > depdiff.json || echo "[]"
+
+          # Keep only changes that carry vulnerabilities
+          jq '
+            [ .[] | select(.vulnerabilities | length > 0)
+              | {manifest, ecosystem, name, version, vulnerabilities}
+            ]
+          ' depdiff.json > depalerts.json
+
+          COUNT=$(jq 'length' depalerts.json)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No dependency vulnerabilities introduced by this PR."
+            exit 0
+          fi
+
+          # Build markdown bullet list of vulns
+          LINES=$(jq -r '
+            .[] as $p
+            | $p.vulnerabilities[]
+            | "* \($p.ecosystem) \($p.name)@\($p.version) in \($p.manifest): \(.advisory_ghsa_id) \(.severity) - \(.advisory_summary) (\(.advisory_url))"
+          ' depalerts.json)
+
+          # One Issue per PR; update if it exists
+          EXISTING=$(gh issue list --state open --search "in:title Dependency vulnerabilities detected in PR #${PR}" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "Updated dependency-review results:\n\n${LINES}"
+          else
+            gh issue create \
+              --title "Dependency vulnerabilities detected in PR #${PR}" \
+              --body "Dependency review found the following vulnerabilities introduced by this pull request:\n\n${LINES}\n\n(See the Dependency Review check for details.)" \
+              --label "Vulnerability Found"
+          fi
